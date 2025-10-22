@@ -1,0 +1,705 @@
+ here’s a lightweight “mini-Jira” you can drop into a repo. it’s FastAPI + APSW (SQLite) on the backend (no auth), and Create React App on the frontend with a single page feedback.js (user hard-coded). users can only submit feedback to developer-controlled projects (nfrfscenario, nfrfconnect) defined in config.py.
+CAUTION: NO DARK BACKGROUND, NO ROUND EDGES, NO BLACK COLOR IN BACKGROUND, WHITE, RED, AND BLACK AS UBS BANK COLOR. KEEP IT ONE PAGE. MAIN PAGE IS feedback.js and all its components like api, and other components goes into folder called components create folder feedback and all the files inside it.
+CAUTION: for backend create router called feedback_router and add in the app.
+⸻
+
+backend (FastAPI + APSW)
+
+folder layout
+
+backend/
+  app.py
+  db.py
+  config.py
+  schemas.py
+  requirements.txt
+
+requirements.txt
+
+fastapi==0.115.5
+uvicorn==0.32.0
+apsw==3.47.0.0        # APSW: Another Python SQLite Wrapper
+pydantic==2.9.2
+python-dotenv==1.0.1  # optional if you want env vars
+
+config.py
+
+# config.py
+from pathlib import Path
+
+DB_PATH = Path("./feedback.db")
+
+# developer-controlled projects; users can *not* add here
+ALLOWED_PROJECTS = [
+    {"key": "nfrfscenario", "name": "NFRF Scenario"},
+    {"key": "nfrfconnect",  "name": "NFRF Connect"},
+]
+
+FEEDBACK_TYPES = ["bug", "feature"]
+STATUSES = ["open", "in_progress", "resolved", "closed"]
+SEVERITIES = ["low", "medium", "high", "critical"]  # optional
+PAGE_SIZE_DEFAULT = 20
+PAGE_SIZE_MAX = 100
+
+db.py (APSW setup + schema + simple helpers)
+
+# db.py
+import apsw
+from datetime import datetime
+from typing import Iterable, Any, Dict, Optional
+from contextlib import contextmanager
+from . import config
+
+def _connect() -> apsw.Connection:
+    # APSW gives direct SQLite; set WAL + foreign keys + busy timeout
+    con = apsw.Connection(str(config.DB_PATH))
+    with con:
+        con.execute("PRAGMA journal_mode=WAL;")
+        con.execute("PRAGMA foreign_keys=ON;")
+        con.execute("PRAGMA busy_timeout=5000;")  # ms
+    return con
+
+@contextmanager
+def get_con():
+    con = _connect()
+    try:
+        yield con
+    finally:
+        con.close()
+
+def init_db():
+    with get_con() as con, con:
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS projects (
+          id INTEGER PRIMARY KEY,
+          key TEXT UNIQUE NOT NULL,
+          name TEXT NOT NULL,
+          active INTEGER NOT NULL DEFAULT 1
+        );
+        """)
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS feedback (
+          id INTEGER PRIMARY KEY,
+          project_key TEXT NOT NULL REFERENCES projects(key) ON UPDATE CASCADE ON DELETE RESTRICT,
+          type TEXT NOT NULL,                    -- 'bug' | 'feature'
+          title TEXT NOT NULL,
+          description TEXT NOT NULL,
+          severity TEXT,
+          status TEXT NOT NULL DEFAULT 'open',   -- from config.STATUSES
+          created_by TEXT NOT NULL,
+          assignee TEXT,
+          resolution TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        """)
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS comments (
+          id INTEGER PRIMARY KEY,
+          feedback_id INTEGER NOT NULL REFERENCES feedback(id) ON DELETE CASCADE,
+          body TEXT NOT NULL,
+          created_by TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        """)
+        # seed allowed projects
+        for p in config.ALLOWED_PROJECTS:
+            con.execute(
+                "INSERT OR IGNORE INTO projects(key,name,active) VALUES(?,?,1);",
+                (p["key"], p["name"])
+            )
+
+def query(con: apsw.Connection, sql: str, params: Iterable[Any] = ()):
+    cur = con.execute(sql, params)
+    cols = [d[0] for d in cur.getdescription()]
+    for row in cur:
+        yield dict(zip(cols, row))
+
+def scalar(con: apsw.Connection, sql: str, params: Iterable[Any] = ()):
+    cur = con.execute(sql, params)
+    r = cur.fetchone()
+    return r[0] if r else None
+
+def now_iso() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+schemas.py (Pydantic I/O models)
+
+# schemas.py
+from pydantic import BaseModel, Field
+from typing import Optional, Literal, List
+from .config import FEEDBACK_TYPES, STATUSES, SEVERITIES
+
+TypeLiteral = Literal[tuple(FEEDBACK_TYPES)]
+StatusLiteral = Literal[tuple(STATUSES)]
+SeverityLiteral = Literal[tuple(SEVERITIES)]
+
+class ProjectOut(BaseModel):
+    key: str
+    name: str
+    active: bool
+
+class FeedbackCreate(BaseModel):
+    project_key: str = Field(..., examples=["nfrfscenario"])
+    type: TypeLiteral
+    title: str
+    description: str
+    severity: Optional[SeverityLiteral] = None
+    created_by: str  # from frontend hard-coded user
+
+class FeedbackUpdate(BaseModel):
+    status: Optional[StatusLiteral] = None
+    assignee: Optional[str] = None
+    resolution: Optional[str] = None
+    title: Optional[str] = None
+    description: Optional[str] = None
+    severity: Optional[SeverityLiteral] = None
+
+class FeedbackOut(BaseModel):
+    id: int
+    project_key: str
+    type: str
+    title: str
+    description: str
+    severity: Optional[str]
+    status: str
+    created_by: str
+    assignee: Optional[str]
+    resolution: Optional[str]
+    created_at: str
+    updated_at: str
+
+class CommentCreate(BaseModel):
+    body: str
+    created_by: str
+
+class CommentOut(BaseModel):
+    id: int
+    feedback_id: int
+    body: str
+    created_by: str
+    created_at: str
+
+class FeedbackListOut(BaseModel):
+    items: List[FeedbackOut]
+    total: int
+    page: int
+    page_size: int
+
+app.py (routes)
+
+# app.py
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional
+from . import db, config
+from .schemas import (
+    FeedbackCreate, FeedbackUpdate, FeedbackOut,
+    CommentCreate, CommentOut, FeedbackListOut, ProjectOut
+)
+
+app = FastAPI(title="Light Feedback API", version="0.1.0")
+
+# CORS for CRA dev server
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.on_event("startup")
+def startup():
+    db.init_db()
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+@app.get("/projects", response_model=list[ProjectOut])
+def list_projects():
+    with db.get_con() as con:
+        rows = list(db.query(con, "SELECT key,name,active FROM projects WHERE active=1 ORDER BY name;"))
+    return [{"key": r["key"], "name": r["name"], "active": bool(r["active"])} for r in rows]
+
+@app.post("/feedback", response_model=FeedbackOut)
+def create_feedback(payload: FeedbackCreate):
+    # enforce developer-controlled projects
+    allowed = {p["key"] for p in config.ALLOWED_PROJECTS}
+    if payload.project_key not in allowed:
+        raise HTTPException(400, f"Project '{payload.project_key}' is not allowed.")
+
+    if payload.type not in config.FEEDBACK_TYPES:
+        raise HTTPException(400, "Invalid type.")
+    if payload.severity and payload.severity not in config.SEVERITIES:
+        raise HTTPException(400, "Invalid severity.")
+
+    now = db.now_iso()
+    with db.get_con() as con, con:
+        con.execute("""
+          INSERT INTO feedback (project_key,type,title,description,severity,status,created_by,created_at,updated_at)
+          VALUES (?,?,?,?,?,'open',?,?,?);
+        """, (payload.project_key, payload.type, payload.title, payload.description, payload.severity,
+              payload.created_by, now, now))
+        fid = db.scalar(con, "SELECT last_insert_rowid();")
+        row = next(db.query(con, "SELECT * FROM feedback WHERE id=?;", (fid,)))
+    return row  # keys match FeedbackOut
+
+@app.get("/feedback", response_model=FeedbackListOut)
+def list_feedback(
+    project_key: Optional[str] = None,
+    status: Optional[str] = None,
+    ftype: Optional[str] = Query(None, alias="type"),
+    search: Optional[str] = None,
+    page: int = 1,
+    page_size: int = config.PAGE_SIZE_DEFAULT,
+    sort: str = "-created_at"  # '-created_at' or 'created_at' etc.
+):
+    if page_size > config.PAGE_SIZE_MAX:
+        page_size = config.PAGE_SIZE_MAX
+
+    clauses, params = [], []
+    if project_key:
+        clauses.append("project_key=?"); params.append(project_key)
+    if status:
+        clauses.append("status=?"); params.append(status)
+    if ftype:
+        clauses.append("type=?"); params.append(ftype)
+    if search:
+        clauses.append("(title LIKE ? OR description LIKE ?)"); params.extend([f"%{search}%", f"%{search}%"])
+
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    order = "created_at DESC" if sort.startswith("-") else "created_at ASC"
+
+    with db.get_con() as con:
+        total = db.scalar(con, f"SELECT COUNT(*) FROM feedback {where};", params) or 0
+        offset = (page - 1) * page_size
+        items = list(db.query(con, f"""
+            SELECT * FROM feedback {where}
+            ORDER BY {order}
+            LIMIT ? OFFSET ?;
+        """, (*params, page_size, offset)))
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+@app.get("/feedback/{fid}", response_model=FeedbackOut)
+def get_feedback(fid: int):
+    with db.get_con() as con:
+        row = next(db.query(con, "SELECT * FROM feedback WHERE id=?;", (fid,)), None)
+    if not row:
+        raise HTTPException(404, "Not found")
+    return row
+
+@app.patch("/feedback/{fid}", response_model=FeedbackOut)
+def update_feedback(fid: int, payload: FeedbackUpdate):
+    fields, params = [], []
+    if payload.status:
+        if payload.status not in config.STATUSES:
+            raise HTTPException(400, "Invalid status")
+        fields.append("status=?"); params.append(payload.status)
+    if payload.assignee is not None:
+        fields.append("assignee=?"); params.append(payload.assignee)
+    if payload.resolution is not None:
+        fields.append("resolution=?"); params.append(payload.resolution)
+    if payload.title is not None:
+        fields.append("title=?"); params.append(payload.title)
+    if payload.description is not None:
+        fields.append("description=?"); params.append(payload.description)
+    if payload.severity is not None:
+        if payload.severity not in config.SEVERITIES:
+            raise HTTPException(400, "Invalid severity")
+        fields.append("severity=?"); params.append(payload.severity)
+
+    if not fields:
+        raise HTTPException(400, "Nothing to update")
+
+    params.extend([db.now_iso(), fid])
+    with db.get_con() as con, con:
+        cur = con.execute(f"UPDATE feedback SET {', '.join(fields)}, updated_at=? WHERE id=?;", params)
+        if cur.changes() == 0:
+            raise HTTPException(404, "Not found")
+        row = next(db.query(con, "SELECT * FROM feedback WHERE id=?;", (fid,)))
+    return row
+
+@app.post("/feedback/{fid}/comments", response_model=CommentOut)
+def add_comment(fid: int, payload: CommentCreate):
+    now = db.now_iso()
+    with db.get_con() as con, con:
+        # ensure feedback exists
+        exists = db.scalar(con, "SELECT 1 FROM feedback WHERE id=?;", (fid,))
+        if not exists:
+            raise HTTPException(404, "Feedback not found")
+        con.execute("""
+        INSERT INTO comments (feedback_id, body, created_by, created_at)
+        VALUES (?,?,?,?);
+        """, (fid, payload.body, payload.created_by, now))
+        cid = db.scalar(con, "SELECT last_insert_rowid();")
+        row = next(db.query(con, "SELECT * FROM comments WHERE id=?;", (cid,)))
+    return row
+
+@app.get("/feedback/{fid}/comments", response_model=list[CommentOut])
+def list_comments(fid: int):
+    with db.get_con() as con:
+        rows = list(db.query(con, "SELECT * FROM comments WHERE feedback_id=? ORDER BY created_at ASC;", (fid,)))
+    return rows
+
+run it
+
+cd backend
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app:app --reload
+
+
+⸻
+
+frontend (CRA)
+
+folder layout
+
+frontend/
+  package.json
+  src/
+    index.js
+    pages/feedback.js           # main page; hard-coded user
+    components/
+      FeedbackForm.jsx
+      FeedbackFilters.jsx
+      FeedbackList.jsx
+      FeedbackItem.jsx
+    api.js
+
+package.json (minimal CRA)
+
+{
+  "name": "light-feedback-ui",
+  "private": true,
+  "version": "0.1.0",
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-scripts": "5.0.1"
+  },
+  "scripts": {
+    "start": "PORT=3000 react-scripts start",
+    "build": "react-scripts build"
+  }
+}
+
+src/index.js
+
+import React from "react";
+import { createRoot } from "react-dom/client";
+import Feedback from "./pages/feedback";
+createRoot(document.getElementById("root")).render(<Feedback />);
+
+src/api.js
+
+const API = "http://localhost:8000";
+
+export async function listProjects() {
+  const r = await fetch(`${API}/projects`);
+  return r.json();
+}
+export async function createFeedback(data) {
+  const r = await fetch(`${API}/feedback`, {
+    method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify(data)
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+export async function listFeedback(params = {}) {
+  const qs = new URLSearchParams(params).toString();
+  const r = await fetch(`${API}/feedback?${qs}`);
+  return r.json();
+}
+export async function getFeedback(id) {
+  const r = await fetch(`${API}/feedback/${id}`);
+  return r.json();
+}
+export async function patchFeedback(id, data) {
+  const r = await fetch(`${API}/feedback/${id}`, {
+    method: "PATCH",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify(data)
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+export async function addComment(id, data) {
+  const r = await fetch(`${API}/feedback/${id}/comments`, {
+    method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify(data)
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+export async function listComments(id) {
+  const r = await fetch(`${API}/feedback/${id}/comments`);
+  return r.json();
+}
+
+src/pages/feedback.js (user hard-coded)
+
+import React, { useEffect, useMemo, useState } from "react";
+import { listProjects, listFeedback, createFeedback, patchFeedback, addComment } from "../api";
+import FeedbackForm from "../components/FeedbackForm";
+import FeedbackFilters from "../components/FeedbackFilters";
+import FeedbackList from "../components/FeedbackList";
+
+const currentUser = "preetam"; // hard-coded for now
+
+export default function Feedback() {
+  const [projects, setProjects] = useState([]);
+  const [filters, setFilters] = useState({ project_key: "", status: "", type: "", search: "" });
+  const [page, setPage] = useState(1);
+  const [data, setData] = useState({ items: [], total: 0, page: 1, page_size: 20 });
+  const pageSize = 20;
+
+  useEffect(() => {
+    listProjects().then(setProjects);
+  }, []);
+
+  const load = () => {
+    const params = { page, page_size: pageSize };
+    if (filters.project_key) params.project_key = filters.project_key;
+    if (filters.status) params.status = filters.status;
+    if (filters.type) params.type = filters.type;
+    if (filters.search) params.search = filters.search;
+    listFeedback(params).then(setData);
+  };
+
+  useEffect(() => { load(); /* eslint-disable-next-line */ }, [filters, page]);
+
+  const submitFeedback = async (payload) => {
+    await createFeedback({ ...payload, created_by: currentUser });
+    setPage(1);
+    load();
+  };
+
+  const updateFeedback = async (id, patch) => {
+    await patchFeedback(id, patch);
+    load();
+  };
+
+  const submitComment = async (id, body) => {
+    await addComment(id, { body, created_by: currentUser });
+    load();
+  };
+
+  return (
+    <div style={{ maxWidth: 980, margin: "24px auto", padding: 16 }}>
+      <h2>Project Feedback</h2>
+      <FeedbackForm projects={projects} onSubmit={submitFeedback} />
+      <FeedbackFilters projects={projects} value={filters} onChange={setFilters} />
+      <FeedbackList data={data} onPageChange={setPage} pageSize={pageSize}
+        onUpdate={updateFeedback} onComment={submitComment} />
+    </div>
+  );
+}
+
+src/components/FeedbackForm.jsx
+
+import React, { useState } from "react";
+
+export default function FeedbackForm({ projects, onSubmit }) {
+  const [form, setForm] = useState({
+    project_key: "",
+    type: "bug",
+    title: "",
+    description: "",
+    severity: "medium"
+  });
+
+  const disabled = !form.project_key || !form.title || !form.description;
+
+  return (
+    <div style={{ border: "1px solid #ddd", padding: 16, borderRadius: 8, marginBottom: 16 }}>
+      <h3>New Feedback</h3>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+        <label>
+          Project
+          <select value={form.project_key}
+            onChange={e => setForm({ ...form, project_key: e.target.value })}>
+            <option value="">Select…</option>
+            {projects.map(p => <option key={p.key} value={p.key}>{p.name}</option>)}
+          </select>
+        </label>
+        <label>
+          Type
+          <select value={form.type} onChange={e => setForm({ ...form, type: e.target.value })}>
+            <option value="bug">Bug</option>
+            <option value="feature">Feature</option>
+          </select>
+        </label>
+      </div>
+      <label style={{ display: "block", marginTop: 8 }}>
+        Title
+        <input value={form.title} onChange={e => setForm({ ...form, title: e.target.value })} />
+      </label>
+      <label style={{ display: "block", marginTop: 8 }}>
+        Description
+        <textarea rows={4} value={form.description}
+          onChange={e => setForm({ ...form, description: e.target.value })} />
+      </label>
+      <label style={{ display: "block", marginTop: 8 }}>
+        Severity
+        <select value={form.severity} onChange={e => setForm({ ...form, severity: e.target.value })}>
+          <option>low</option><option>medium</option><option>high</option><option>critical</option>
+        </select>
+      </label>
+      <button disabled={disabled} style={{ marginTop: 12 }}
+        onClick={() => !disabled && onSubmit(form)}>Submit</button>
+    </div>
+  );
+}
+
+src/components/FeedbackFilters.jsx
+
+import React from "react";
+
+export default function FeedbackFilters({ projects, value, onChange }) {
+  const set = (k, v) => onChange({ ...value, [k]: v });
+  return (
+    <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 16 }}>
+      <select value={value.project_key} onChange={e => set("project_key", e.target.value)}>
+        <option value="">All Projects</option>
+        {projects.map(p => <option key={p.key} value={p.key}>{p.name}</option>)}
+      </select>
+      <select value={value.type} onChange={e => set("type", e.target.value)}>
+        <option value="">All Types</option>
+        <option value="bug">Bug</option>
+        <option value="feature">Feature</option>
+      </select>
+      <select value={value.status} onChange={e => set("status", e.target.value)}>
+        <option value="">All Statuses</option>
+        <option value="open">Open</option>
+        <option value="in_progress">In Progress</option>
+        <option value="resolved">Resolved</option>
+        <option value="closed">Closed</option>
+      </select>
+      <input
+        placeholder="Search title/description…"
+        value={value.search}
+        onChange={e => set("search", e.target.value)}
+        style={{ flex: 1 }}
+      />
+    </div>
+  );
+}
+
+src/components/FeedbackList.jsx
+
+import React, { useState } from "react";
+import FeedbackItem from "./FeedbackItem";
+
+export default function FeedbackList({ data, onPageChange, pageSize, onUpdate, onComment }) {
+  const { items, page, total } = data;
+  const [expanded, setExpanded] = useState(null);
+  const pages = Math.max(1, Math.ceil(total / pageSize));
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
+        <div>{total} result(s)</div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button disabled={page<=1} onClick={() => onPageChange(page-1)}>Prev</button>
+          <span>Page {page}/{pages}</span>
+          <button disabled={page>=pages} onClick={() => onPageChange(page+1)}>Next</button>
+        </div>
+      </div>
+
+      {items.map(it => (
+        <FeedbackItem key={it.id}
+          item={it}
+          expanded={expanded === it.id}
+          onToggle={() => setExpanded(expanded === it.id ? null : it.id)}
+          onUpdate={onUpdate}
+          onComment={onComment}
+        />
+      ))}
+    </div>
+  );
+}
+
+src/components/FeedbackItem.jsx
+
+import React, { useState } from "react";
+
+export default function FeedbackItem({ item, expanded, onToggle, onUpdate, onComment }) {
+  const [patch, setPatch] = useState({ status: "", assignee: "", resolution: "" });
+  const [comment, setComment] = useState("");
+
+  return (
+    <div style={{ border: "1px solid #eee", borderRadius: 8, padding: 12, marginBottom: 8 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", cursor: "pointer" }} onClick={onToggle}>
+        <div>
+          <strong>#{item.id}</strong> [{item.project_key}] {item.type.toUpperCase()} — {item.title}
+          <div style={{ fontSize: 12, color: "#666" }}>
+            status: {item.status} • severity: {item.severity || "-"} • by: {item.created_by} • {item.created_at}
+          </div>
+        </div>
+        <div>▼</div>
+      </div>
+
+      {expanded && (
+        <div style={{ marginTop: 8 }}>
+          <p style={{ whiteSpace: "pre-wrap" }}>{item.description}</p>
+
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0,1fr))", gap: 8 }}>
+            <select value={patch.status} onChange={e => setPatch({ ...patch, status: e.target.value })}>
+              <option value="">Set status…</option>
+              <option value="open">Open</option>
+              <option value="in_progress">In Progress</option>
+              <option value="resolved">Resolved</option>
+              <option value="closed">Closed</option>
+            </select>
+            <input placeholder="Assignee"
+              value={patch.assignee}
+              onChange={e => setPatch({ ...patch, assignee: e.target.value })} />
+            <input placeholder="Resolution"
+              value={patch.resolution}
+              onChange={e => setPatch({ ...patch, resolution: e.target.value })} />
+            <button onClick={() => {
+              const clean = Object.fromEntries(Object.entries(patch).filter(([,v]) => v !== ""));
+              onUpdate(item.id, clean);
+              setPatch({ status: "", assignee: "", resolution: "" });
+            }}>Update</button>
+          </div>
+
+          <div style={{ marginTop: 8 }}>
+            <input style={{ width: "80%" }} placeholder="Add a comment…"
+              value={comment} onChange={e => setComment(e.target.value)} />
+            <button onClick={() => { if (comment.trim()) { onComment(item.id, comment.trim()); setComment(""); } }}>
+              Comment
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+run it
+
+cd frontend
+npm install
+npm start
+# open http://localhost:3000 (backend must be running on :8000)
+
+
+⸻
+
+how it works (brief)
+	•	Developer control of projects: the only valid projects live in config.ALLOWED_PROJECTS. Backend seeds them into the projects table on startup. Users can’t create projects; POST /feedback validates project_key against that whitelist.
+	•	No auth: the frontend sets created_by from a hard-coded currentUser in feedback.js. You can later swap this for real auth — no schema change needed.
+	•	SQLite via APSW: direct SQLite access, WAL mode for decent concurrency, busy_timeout for brief lock contention. Each request opens/closes a connection (simple & safe).
+	•	Filtering & pagination: /feedback supports project_key, status, type, search, page, page_size, and sort on created_at.
+	•	Comments: /feedback/{id}/comments to add/list. (No edit/delete to keep MVP minimal.)
+
+⸻
+
+
