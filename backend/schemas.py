@@ -1,11 +1,10 @@
 # schemas.py
 from pydantic import BaseModel, Field
 from typing import Optional, Literal, List
-import config
 
-TypeLiteral = Literal[tuple(config.FEEDBACK_TYPES)]
-StatusLiteral = Literal[tuple(config.STATUSES)]
-SeverityLiteral = Literal[tuple(config.SEVERITIES)]
+TypeLiteral = Literal["bug", "feature"]
+StatusLiteral = Literal["pending", "in_progress", "resolved", "closed"]
+SeverityLiteral = Literal["low", "medium", "high", "critical"]
 
 class ProjectOut(BaseModel):
     key: str
@@ -18,6 +17,7 @@ class FeedbackCreate(BaseModel):
     title: str
     description: str
     severity: Optional[SeverityLiteral] = None
+    assignee: Optional[str] = None
     created_by: str  # from frontend hard-coded user
 
 class FeedbackUpdate(BaseModel):
@@ -27,6 +27,7 @@ class FeedbackUpdate(BaseModel):
     title: Optional[str] = None
     description: Optional[str] = None
     severity: Optional[SeverityLiteral] = None
+    updated_by: str
 
 class FeedbackOut(BaseModel):
     id: int

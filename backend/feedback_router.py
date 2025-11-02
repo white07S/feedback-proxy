@@ -20,6 +20,10 @@ def list_projects():
         rows = list(db.query(con, "SELECT key,name,active FROM projects WHERE active=1 ORDER BY name;"))
     return [{"key": r["key"], "name": r["name"], "active": bool(r["active"])} for r in rows]
 
+@router.get("/people")
+def list_people():
+    return config.PEOPLE
+
 @router.post("/feedback", response_model=FeedbackOut)
 def create_feedback(payload: FeedbackCreate):
     # enforce developer-controlled projects
@@ -32,13 +36,19 @@ def create_feedback(payload: FeedbackCreate):
     if payload.severity and payload.severity not in config.SEVERITIES:
         raise HTTPException(400, "Invalid severity.")
 
+    assignee = payload.assignee.strip() if payload.assignee else None
+    if assignee:
+        valid_users = {p["username"] for p in config.PEOPLE}
+        if assignee not in valid_users:
+            raise HTTPException(400, "Invalid assignee.")
+
     now = db.now_iso()
     with db.get_con() as con, con:
         con.execute("""
-          INSERT INTO feedback (project_key,type,title,description,severity,status,created_by,created_at,updated_at)
-          VALUES (?,?,?,?,?,'open',?,?,?);
+          INSERT INTO feedback (project_key,type,title,description,severity,status,created_by,assignee,created_at,updated_at)
+          VALUES (?,?,?,?,?,'pending',?,?,?,?);
         """, (payload.project_key, payload.type, payload.title, payload.description, payload.severity,
-              payload.created_by, now, now))
+              payload.created_by, assignee, now, now))
         fid = db.scalar(con, "SELECT last_insert_rowid();")
         row = next(db.query(con, "SELECT * FROM feedback WHERE id=?;", (fid,)))
     return row  # keys match FeedbackOut
@@ -55,6 +65,10 @@ def list_feedback(
 ):
     if page_size > config.PAGE_SIZE_MAX:
         page_size = config.PAGE_SIZE_MAX
+    if page_size < 1:
+        page_size = 1
+    if page < 1:
+        page = 1
 
     clauses, params = [], []
     if project_key:
@@ -89,31 +103,51 @@ def get_feedback(fid: int):
 
 @router.patch("/feedback/{fid}", response_model=FeedbackOut)
 def update_feedback(fid: int, payload: FeedbackUpdate):
+    actor = payload.updated_by.strip()
+    if not actor:
+        raise HTTPException(400, "updated_by is required")
+
     fields, params = [], []
-    if payload.status:
-        if payload.status not in config.STATUSES:
-            raise HTTPException(400, "Invalid status")
-        fields.append("status=?"); params.append(payload.status)
-    if payload.assignee is not None:
-        fields.append("assignee=?"); params.append(payload.assignee)
-    if payload.resolution is not None:
-        fields.append("resolution=?"); params.append(payload.resolution)
-    if payload.title is not None:
-        fields.append("title=?"); params.append(payload.title)
-    if payload.description is not None:
-        fields.append("description=?"); params.append(payload.description)
-    if payload.severity is not None:
-        if payload.severity not in config.SEVERITIES:
-            raise HTTPException(400, "Invalid severity")
-        fields.append("severity=?"); params.append(payload.severity)
 
-    if not fields:
-        raise HTTPException(400, "Nothing to update")
-
-    params.extend([db.now_iso(), fid])
     with db.get_con() as con, con:
-        cur = con.execute(f"UPDATE feedback SET {', '.join(fields)}, updated_at=? WHERE id=?;", params)
-        if cur.changes() == 0:
+        existing = next(db.query(con, "SELECT * FROM feedback WHERE id=?;", (fid,)), None)
+        if not existing:
+            raise HTTPException(404, "Not found")
+
+        assignee_target = payload.assignee
+        if assignee_target == "":
+            assignee_target = None
+
+        if payload.status:
+            if payload.status not in config.STATUSES:
+                raise HTTPException(400, "Invalid status")
+            fields.append("status=?"); params.append(payload.status)
+        if payload.assignee is not None:
+            valid_users = {p["username"] for p in config.PEOPLE}
+            if assignee_target and assignee_target not in valid_users:
+                raise HTTPException(400, "Invalid assignee")
+            fields.append("assignee=?"); params.append(assignee_target)
+        if payload.resolution is not None:
+            fields.append("resolution=?"); params.append(payload.resolution)
+        if payload.title is not None:
+            fields.append("title=?"); params.append(payload.title)
+        if payload.description is not None:
+            fields.append("description=?"); params.append(payload.description)
+        if payload.severity is not None:
+            if payload.severity not in config.SEVERITIES:
+                raise HTTPException(400, "Invalid severity")
+            fields.append("severity=?"); params.append(payload.severity)
+
+        if not fields:
+            raise HTTPException(400, "Nothing to update")
+
+        restricted = any(f in ["status=?", "resolution=?", "title=?", "description=?", "severity=?"] for f in fields)
+        if restricted and existing.get("assignee") != actor:
+            raise HTTPException(403, "Only the assigned user can update this feedback item.")
+
+        params.extend([db.now_iso(), fid])
+        con.execute(f"UPDATE feedback SET {', '.join(fields)}, updated_at=? WHERE id=?;", params)
+        if con.changes() == 0:
             raise HTTPException(404, "Not found")
         row = next(db.query(con, "SELECT * FROM feedback WHERE id=?;", (fid,)))
     return row

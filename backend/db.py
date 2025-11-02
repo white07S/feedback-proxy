@@ -40,7 +40,7 @@ def init_db():
           title TEXT NOT NULL,
           description TEXT NOT NULL,
           severity TEXT,
-          status TEXT NOT NULL DEFAULT 'open',   -- from config.STATUSES
+          status TEXT NOT NULL DEFAULT 'pending',   -- from config.STATUSES
           created_by TEXT NOT NULL,
           assignee TEXT,
           resolution TEXT,
