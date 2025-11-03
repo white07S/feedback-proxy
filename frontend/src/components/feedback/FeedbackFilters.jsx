@@ -30,7 +30,7 @@ export default function FeedbackFilters({ projects, value, onChange }) {
         className="p-2 border border-gray-300 bg-white text-black focus:border-ubs-red focus:outline-none"
       >
         <option value="">All Statuses</option>
-        <option value="open">Open</option>
+        <option value="pending">Pending</option>
         <option value="in_progress">In Progress</option>
         <option value="resolved">Resolved</option>
         <option value="closed">Closed</option>

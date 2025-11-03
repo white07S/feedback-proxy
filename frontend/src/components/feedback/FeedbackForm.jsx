@@ -1,12 +1,13 @@
 import React, { useState } from "react";
 
-export default function FeedbackForm({ projects, onSubmit }) {
+export default function FeedbackForm({ projects, people = [], onSubmit }) {
   const [form, setForm] = useState({
     project_key: "",
     type: "bug",
     title: "",
     description: "",
-    severity: "medium"
+    severity: "medium",
+    assignee: ""
   });
 
   const disabled = !form.project_key || !form.title || !form.description;
@@ -20,7 +21,8 @@ export default function FeedbackForm({ projects, onSubmit }) {
         type: "bug",
         title: "",
         description: "",
-        severity: "medium"
+        severity: "medium",
+        assignee: ""
       });
     }
   };
@@ -28,7 +30,7 @@ export default function FeedbackForm({ projects, onSubmit }) {
   return (
     <div className="border border-gray-300 bg-white p-4 mb-4">
       <h3 className="text-xl font-bold text-black mb-4">New Feedback</h3>
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
         <div>
           <label className="block text-sm font-medium text-black mb-1">
             Project
@@ -53,6 +55,23 @@ export default function FeedbackForm({ projects, onSubmit }) {
           >
             <option value="bug">Bug</option>
             <option value="feature">Feature</option>
+          </select>
+        </div>
+        <div>
+          <label className="block text-sm font-medium text-black mb-1">
+            Assign To
+          </label>
+          <select
+            value={form.assignee}
+            onChange={e => setForm({ ...form, assignee: e.target.value })}
+            className="w-full p-2 border border-gray-300 bg-white text-black focus:border-ubs-red focus:outline-none"
+          >
+            <option value="">Unassigned</option>
+            {people.map(person => (
+              <option key={person.username} value={person.username}>
+                {person.name}
+              </option>
+            ))}
           </select>
         </div>
       </div>

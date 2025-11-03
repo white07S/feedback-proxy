@@ -5,6 +5,11 @@ export async function listProjects() {
   return r.json();
 }
 
+export async function listPeople() {
+  const r = await fetch(`${API}/people`);
+  return r.json();
+}
+
 export async function createFeedback(data) {
   const r = await fetch(`${API}/feedback`, {
     method: "POST",

@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import FeedbackItem from "./FeedbackItem";
 
-export default function FeedbackList({ data, onPageChange, pageSize, onUpdate, onComment }) {
+export default function FeedbackList({ data, onPageChange, pageSize, onUpdate, onComment, people, currentUser }) {
   const { items, page, total } = data;
   const [expanded, setExpanded] = useState(null);
   const pages = Math.max(1, Math.ceil(total / pageSize));
@@ -56,6 +56,8 @@ export default function FeedbackList({ data, onPageChange, pageSize, onUpdate, o
               onToggle={() => setExpanded(expanded === item.id ? null : item.id)}
               onUpdate={onUpdate}
               onComment={onComment}
+              people={people}
+              currentUser={currentUser}
             />
           ))}
         </div>

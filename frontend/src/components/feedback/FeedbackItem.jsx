@@ -1,10 +1,15 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 import { listComments } from "./api";
 
-export default function FeedbackItem({ item, expanded, onToggle, onUpdate, onComment }) {
+export default function FeedbackItem({ item, expanded, onToggle, onUpdate, onComment, people, currentUser }) {
   const [patch, setPatch] = useState({ status: "", assignee: "", resolution: "" });
   const [comment, setComment] = useState("");
   const [comments, setComments] = useState([]);
+  const isMine = item.assignee === currentUser;
+  const peopleLookup = useMemo(
+    () => Object.fromEntries(people.map(person => [person.username, person.name])),
+    [people]
+  );
 
   useEffect(() => {
     if (expanded) {
@@ -12,12 +17,23 @@ export default function FeedbackItem({ item, expanded, onToggle, onUpdate, onCom
     }
   }, [expanded, item.id]);
 
-  const handleUpdate = () => {
-    const clean = Object.fromEntries(Object.entries(patch).filter(([,v]) => v !== ""));
-    if (Object.keys(clean).length > 0) {
-      onUpdate(item.id, clean);
+  useEffect(() => {
+    if (!expanded) {
       setPatch({ status: "", assignee: "", resolution: "" });
     }
+  }, [expanded, item.id]);
+
+  const cleanPatch = useMemo(
+    () => Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== "")),
+    [patch]
+  );
+  const hasRestrictedChanges = Boolean(cleanPatch.status || cleanPatch.resolution);
+  const updateDisabled = Object.keys(cleanPatch).length === 0 || (!isMine && hasRestrictedChanges);
+
+  const handleUpdate = () => {
+    if (updateDisabled) return;
+    onUpdate(item.id, cleanPatch);
+    setPatch({ status: "", assignee: "", resolution: "" });
   };
 
   const handleComment = () => {
@@ -40,6 +56,7 @@ export default function FeedbackItem({ item, expanded, onToggle, onUpdate, onCom
 
   const statusColors = {
     open: "bg-blue-100 text-blue-800",
+    pending: "bg-gray-100 text-gray-800",
     in_progress: "bg-yellow-100 text-yellow-800",
     resolved: "bg-green-100 text-green-800",
     closed: "bg-gray-100 text-gray-800"
@@ -93,7 +110,7 @@ export default function FeedbackItem({ item, expanded, onToggle, onUpdate, onCom
           {item.assignee && (
             <div className="mb-4">
               <span className="font-medium text-black">Assignee: </span>
-              <span className="text-gray-700">{item.assignee}</span>
+              <span className="text-gray-700">{peopleLookup[item.assignee] || item.assignee}</span>
             </div>
           )}
 
@@ -108,36 +125,55 @@ export default function FeedbackItem({ item, expanded, onToggle, onUpdate, onCom
             <select
               value={patch.status}
               onChange={e => setPatch({ ...patch, status: e.target.value })}
-              className="p-2 border border-gray-300 bg-white text-black focus:border-ubs-red focus:outline-none"
+              disabled={!isMine}
+              className={`p-2 border border-gray-300 ${isMine ? "bg-white" : "bg-gray-100"} text-black focus:border-ubs-red focus:outline-none`}
             >
               <option value="">Set status...</option>
-              <option value="open">Open</option>
+              <option value="pending">Pending</option>
               <option value="in_progress">In Progress</option>
               <option value="resolved">Resolved</option>
               <option value="closed">Closed</option>
             </select>
 
-            <input
-              placeholder="Assignee"
+            <select
               value={patch.assignee}
               onChange={e => setPatch({ ...patch, assignee: e.target.value })}
               className="p-2 border border-gray-300 bg-white text-black focus:border-ubs-red focus:outline-none"
-            />
+            >
+              <option value="">Assign to...</option>
+              {people.map(person => (
+                <option key={person.username} value={person.username}>
+                  {person.name}
+                </option>
+              ))}
+            </select>
 
             <input
               placeholder="Resolution"
               value={patch.resolution}
               onChange={e => setPatch({ ...patch, resolution: e.target.value })}
-              className="p-2 border border-gray-300 bg-white text-black focus:border-ubs-red focus:outline-none"
+              disabled={!isMine}
+              className={`p-2 border border-gray-300 ${isMine ? "bg-white" : "bg-gray-100"} text-black focus:border-ubs-red focus:outline-none`}
             />
 
             <button
               onClick={handleUpdate}
-              className="p-2 bg-ubs-red text-white hover:bg-red-700 transition-colors"
+              disabled={updateDisabled}
+              className={`p-2 ${
+                updateDisabled
+                  ? "bg-gray-400 text-white cursor-not-allowed"
+                  : "bg-ubs-red text-white hover:bg-red-700 cursor-pointer"
+              } transition-colors`}
             >
               Update
             </button>
           </div>
+
+          {!isMine && (
+            <div className="mb-4 text-sm text-gray-600">
+              Only the assigned user can update status or resolution.
+            </div>
+          )}
 
           {comments.length > 0 && (
             <div className="mb-4">
