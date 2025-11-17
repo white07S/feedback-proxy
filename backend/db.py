@@ -1,4 +1,5 @@
 import os
+import asyncio
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Iterable, Any, Optional
@@ -8,12 +9,12 @@ import apsw
 import config
 
 try:
-    import psycopg2
+    import asyncpg
 
     _HAVE_PG = True
 except Exception:
-    # If psycopg2 isn't available we silently fall back to SQLite.
-    psycopg2 = None  # type: ignore[assignment]
+    # If asyncpg isn't available we silently fall back to SQLite.
+    asyncpg = None  # type: ignore[assignment]
     _HAVE_PG = False
 
 
@@ -26,53 +27,111 @@ POSTGRES_SCHEMA = os.getenv("POSTGRES_SCHEMA", "analytics")
 
 
 class DbCursor:
-    def __init__(self, backend: str, raw_cursor: Any):
-        self.backend = backend
-        self._cur = raw_cursor
+    """
+    Simple in-memory cursor that works for both SQLite and Postgres.
+    """
+
+    def __init__(self, columns: Optional[list[str]], rows: list[tuple[Any, ...]]):
+        self._columns = columns or []
+        self._rows = rows
+        self._index = 0
 
     def getdescription(self):
-        if self.backend == "sqlite":
-            return self._cur.getdescription()
-        # psycopg2 returns description as a sequence of tuples
-        return self._cur.description or []
+        # Emulate DB-API cursor.description: sequence of tuples
+        return [(name,) for name in self._columns]
 
     def fetchone(self):
-        return self._cur.fetchone()
+        if self._index >= len(self._rows):
+            return None
+        row = self._rows[self._index]
+        self._index += 1
+        return row
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        if self.backend == "sqlite":
-            return next(self._cur)
-        row = self._cur.fetchone()
+        row = self.fetchone()
         if row is None:
             raise StopIteration
         return row
 
 
+def _convert_placeholders(sql: str) -> str:
+    """
+    Convert SQLite-style '?' placeholders to asyncpg '$1', '$2', ...
+    """
+    out: list[str] = []
+    idx = 1
+    for ch in sql:
+        if ch == "?":
+            out.append(f"${idx}")
+            idx += 1
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 class DbConnection:
     """
     Thin wrapper providing a minimal common API for SQLite (apsw)
-    and Postgres (psycopg2), so the rest of the code can stay
+    and Postgres (asyncpg), so the rest of the code can stay
     mostly unchanged.
     """
 
-    def __init__(self, backend: str, raw_con: Any):
+    def __init__(self, backend: str, raw_con: Any, loop: Optional[asyncio.AbstractEventLoop] = None):
         self.backend = backend
         self._con = raw_con
         self._last_rowcount = 0
+        self._loop = loop
 
     def execute(self, sql: str, params: Iterable[Any] = ()):
         if self.backend == "sqlite":
             cur = self._con.execute(sql, tuple(params))
-            return DbCursor("sqlite", cur)
-        # Postgres: convert SQLite-style '?' placeholders to '%s'
-        sql_pg = sql.replace("?", "%s")
-        cur = self._con.cursor()
-        cur.execute(sql_pg, tuple(params))
-        self._last_rowcount = cur.rowcount
-        return DbCursor("postgres", cur)
+            try:
+                desc = cur.getdescription()
+                columns = [d[0] for d in desc]
+                rows = list(cur)
+            except apsw.ExecutionCompleteError:
+                columns, rows = [], []
+            return DbCursor(columns, rows)
+
+        # Postgres via asyncpg
+        if not self._loop:
+            raise RuntimeError("Event loop is required for Postgres backend")
+
+        sql_pg = _convert_placeholders(sql)
+        params_tuple = tuple(params)
+        normalized = " ".join(sql.strip().lower().split())
+        is_select = normalized.startswith("select")
+
+        if is_select:
+
+            async def _run_select():
+                records = await self._con.fetch(sql_pg, *params_tuple)
+                if records:
+                    cols = list(records[0].keys())
+                    rows = [tuple(r[c] for c in cols) for r in records]
+                else:
+                    cols, rows = [], []
+                self._last_rowcount = len(rows)
+                return cols, rows
+
+            columns, rows = self._loop.run_until_complete(_run_select())
+        else:
+
+            async def _run_exec():
+                status = await self._con.execute(sql_pg, *params_tuple)
+                parts = status.split()
+                count = 0
+                if parts and parts[-1].isdigit():
+                    count = int(parts[-1])
+                self._last_rowcount = count
+                return [], []
+
+            columns, rows = self._loop.run_until_complete(_run_exec())
+
+        return DbCursor(columns, rows)
 
     def changes(self) -> int:
         if self.backend == "sqlite":
@@ -80,16 +139,23 @@ class DbConnection:
         return self._last_rowcount
 
     def close(self):
-        self._con.close()
+        if self.backend == "sqlite":
+            self._con.close()
+        else:
+            if self._loop:
+
+                async def _close():
+                    await self._con.close()
+
+                self._loop.run_until_complete(_close())
+                self._loop.close()
 
     # Transaction context manager: `with con:`
     def __enter__(self):
         if self.backend == "sqlite":
             # Start an explicit transaction
             self._con.execute("BEGIN;")
-        else:
-            # psycopg2 uses implicit transactions; nothing to do on enter
-            pass
+        # For Postgres/asyncpg we rely on per-statement transactions.
         return self
 
     def __exit__(self, exc_type, exc, tb):
@@ -98,11 +164,7 @@ class DbConnection:
                 self._con.execute("ROLLBACK;")
             else:
                 self._con.execute("COMMIT;")
-        else:
-            if exc_type:
-                self._con.rollback()
-            else:
-                self._con.commit()
+        # For Postgres/asyncpg, no explicit transaction handling here.
 
 
 _BACKEND: Optional[str] = None  # "postgres" or "sqlite"
@@ -119,20 +181,25 @@ def _connect_sqlite() -> DbConnection:
 
 def _connect_postgres() -> DbConnection:
     if not _HAVE_PG:
-        raise RuntimeError("psycopg2 not available")
-    con = psycopg2.connect(
-        dbname=POSTGRES_DB,
-        user=POSTGRES_USER,
-        password=POSTGRES_PASSWORD,
-        host=POSTGRES_HOST,
-        port=POSTGRES_PORT,
-    )
-    # Ensure analytics schema exists and is first in search_path
-    cur = con.cursor()
-    cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{POSTGRES_SCHEMA}";')
-    cur.execute(f'SET search_path TO "{POSTGRES_SCHEMA}", public;')
-    con.commit()
-    return DbConnection("postgres", con)
+        raise RuntimeError("asyncpg not available")
+
+    loop = asyncio.new_event_loop()
+
+    async def _connect() -> Any:
+        con = await asyncpg.connect(
+            user=POSTGRES_USER,
+            password=POSTGRES_PASSWORD,
+            database=POSTGRES_DB,
+            host=POSTGRES_HOST,
+            port=POSTGRES_PORT,
+        )
+        # Ensure analytics schema exists and is first in search_path
+        await con.execute(f'CREATE SCHEMA IF NOT EXISTS "{POSTGRES_SCHEMA}";')
+        await con.execute(f'SET search_path TO "{POSTGRES_SCHEMA}", public;')
+        return con
+
+    raw_con = loop.run_until_complete(_connect())
+    return DbConnection("postgres", raw_con, loop)
 
 
 def _connect() -> DbConnection:
