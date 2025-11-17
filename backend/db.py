@@ -134,11 +134,7 @@ class DbConnection:
             self._con.close()
         else:
             if self._loop:
-
-                async def _close():
-                    await self._con.close()
-
-                self._loop.run_until_complete(_close())
+                self._loop.run_until_complete(self._con.close())
                 self._loop.close()
 
     # Transaction context manager: `with con:`
@@ -175,22 +171,27 @@ def _connect_postgres() -> DbConnection:
         raise RuntimeError("asyncpg not available")
 
     loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
-    async def _connect() -> Any:
-        con = await asyncpg.connect(
+    # Create connection
+    con = loop.run_until_complete(
+        asyncpg.connect(
             user=config.POSTGRES_USER,
             password=config.POSTGRES_PASSWORD,
             database=config.POSTGRES_DB,
             host=config.POSTGRES_HOST,
             port=config.POSTGRES_PORT,
         )
-        # Ensure analytics schema exists and is first in search_path
-        await con.execute(f'CREATE SCHEMA IF NOT EXISTS "{config.POSTGRES_SCHEMA}";')
-        await con.execute(f'SET search_path TO "{config.POSTGRES_SCHEMA}", public;')
-        return con
+    )
+    # Ensure analytics schema exists and is first in search_path
+    loop.run_until_complete(
+        con.execute(f'CREATE SCHEMA IF NOT EXISTS "{config.POSTGRES_SCHEMA}";')
+    )
+    loop.run_until_complete(
+        con.execute(f'SET search_path TO "{config.POSTGRES_SCHEMA}", public;')
+    )
 
-    raw_con = loop.run_until_complete(_connect())
-    return DbConnection("postgres", raw_con, loop)
+    return DbConnection("postgres", con, loop)
 
 
 def _connect() -> DbConnection:
