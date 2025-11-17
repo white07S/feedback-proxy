@@ -17,7 +17,7 @@ def health():
 @router.get("/projects", response_model=list[ProjectOut])
 def list_projects():
     with db.get_con() as con:
-        rows = list(db.query(con, "SELECT key,name,active FROM projects WHERE active=1 ORDER BY name;"))
+        rows = list(db.query(con, "SELECT key,name,active FROM projects WHERE active ORDER BY name;"))
     return [{"key": r["key"], "name": r["name"], "active": bool(r["active"])} for r in rows]
 
 @router.get("/people")

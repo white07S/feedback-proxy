@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Iterable, Any, Optional
@@ -6,6 +7,8 @@ from typing import Iterable, Any, Optional
 import apsw
 
 import config
+
+logger = logging.getLogger(__name__)
 
 try:
     import asyncpg
@@ -154,7 +157,7 @@ class DbConnection:
         # For Postgres/asyncpg, no explicit transaction handling here.
 
 
-_BACKEND: Optional[str] = None  # "postgres" or "sqlite"
+_BACKEND: Optional[str] = "postgres"
 
 
 def _connect_sqlite() -> DbConnection:
@@ -202,24 +205,27 @@ def _connect() -> DbConnection:
     """
     global _BACKEND
 
-    if _BACKEND == "postgres":
-        return _connect_postgres()
+    # If we've previously decided on SQLite, always use that.
     if _BACKEND == "sqlite":
         return _connect_sqlite()
 
-    # First time: try Postgres, then SQLite.
+    # Try Postgres when asyncpg is available.
     if _HAVE_PG:
         try:
             con = _connect_postgres()
             _BACKEND = "postgres"
+            logger.info("DB backend selected: postgres (schema=%s)", config.POSTGRES_SCHEMA)
             return con
-        except Exception:
+        except Exception as exc:
             # Any failure: mark backend as sqlite and fall back.
+            logger.warning("Postgres connection failed (%s); falling back to SQLite", exc)
             _BACKEND = "sqlite"
             return _connect_sqlite()
-    else:
-        _BACKEND = "sqlite"
-        return _connect_sqlite()
+
+    # No asyncpg available: use SQLite.
+    logger.info("asyncpg not available; using SQLite backend")
+    _BACKEND = "sqlite"
+    return _connect_sqlite()
 
 
 @contextmanager
@@ -239,6 +245,7 @@ def init_db():
     """
     with get_con() as con, con:
         if getattr(con, "backend", "sqlite") == "postgres":
+            logger.info("Using Postgres backend for schema initialization")
             # Postgres schema (analytics schema is already on search_path)
             con.execute(
                 """
@@ -322,11 +329,13 @@ def init_db():
             )
 
         # seed allowed projects (works on both backends)
+        is_pg = getattr(con, "backend", "sqlite") == "postgres"
+        active_default = True if is_pg else 1
         for p in config.ALLOWED_PROJECTS:
             con.execute(
-                "INSERT INTO projects(key,name,active) VALUES(?,?,1) "
+                "INSERT INTO projects(key,name,active) VALUES(?,?,?) "
                 "ON CONFLICT (key) DO NOTHING;",
-                (p["key"], p["name"]),
+                (p["key"], p["name"], active_default),
             )
 
 
