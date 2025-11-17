@@ -1,4 +1,3 @@
-import os
 import asyncio
 from contextlib import contextmanager
 from datetime import datetime
@@ -16,14 +15,6 @@ except Exception:
     # If asyncpg isn't available we silently fall back to SQLite.
     asyncpg = None  # type: ignore[assignment]
     _HAVE_PG = False
-
-
-POSTGRES_USER = os.getenv("POSTGRES_USER", "preetam")
-POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "preetam123")
-POSTGRES_DB = os.getenv("POSTGRES_DB", "main")
-POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
-POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
-POSTGRES_SCHEMA = os.getenv("POSTGRES_SCHEMA", "analytics")
 
 
 class DbCursor:
@@ -187,15 +178,15 @@ def _connect_postgres() -> DbConnection:
 
     async def _connect() -> Any:
         con = await asyncpg.connect(
-            user=POSTGRES_USER,
-            password=POSTGRES_PASSWORD,
-            database=POSTGRES_DB,
-            host=POSTGRES_HOST,
-            port=POSTGRES_PORT,
+            user=config.POSTGRES_USER,
+            password=config.POSTGRES_PASSWORD,
+            database=config.POSTGRES_DB,
+            host=config.POSTGRES_HOST,
+            port=config.POSTGRES_PORT,
         )
         # Ensure analytics schema exists and is first in search_path
-        await con.execute(f'CREATE SCHEMA IF NOT EXISTS "{POSTGRES_SCHEMA}";')
-        await con.execute(f'SET search_path TO "{POSTGRES_SCHEMA}", public;')
+        await con.execute(f'CREATE SCHEMA IF NOT EXISTS "{config.POSTGRES_SCHEMA}";')
+        await con.execute(f'SET search_path TO "{config.POSTGRES_SCHEMA}", public;')
         return con
 
     raw_con = loop.run_until_complete(_connect())
